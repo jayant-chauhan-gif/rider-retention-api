@@ -3,18 +3,33 @@ const pool = require('../db');
 const router = express.Router();
 
 // Valid whitelists to prevent SQL injection on non-parameterised values
-const VALID_FLEET_LEVELS = { '1': "LOWER(r.vehicle_type) = 'bike'", '2': "LOWER(r.vehicle_type) = 'auto'", '3': "LOWER(r.vehicle_type) IN ('zen_small', 'zen_large')" };
-const VALID_STATUSES = new Set(['delivered', 'cancelled', 'failed', 'returned', 'accepted', 'dispatch', 'ready', 'rejected', 'arrived', 'placed', 'fleet_pending', 'return_requested', 'return_accepted', 'return_pickup', 'return_rejected', 'checkout_pending', 'abandoned']);
+const VALID_FLEET_LEVELS = {
+  '1': "LOWER(r.vehicle_type) = 'bike'",
+  '2': "LOWER(r.vehicle_type) = 'auto'",
+  '3': "LOWER(r.vehicle_type) IN ('zen_small', 'zen_large')",
+};
+const VALID_STATUSES = new Set([
+  'delivered','cancelled','failed','returned','accepted',
+  'dispatch','ready','rejected','arrived','placed',
+  'fleet_pending','return_requested','return_accepted',
+  'return_pickup','return_rejected','checkout_pending','abandoned',
+]);
 
 /**
  * Builds the parameterised retention SQL.
  * weeklyMode = true  → only last 3 weeks (Tab 2)
  * weeklyMode = false → all weeks from W1 2026 (Tab 1)
+ *
+ * No dependency on dim_date — week start computed directly
+ * from fact_rider_trip_orders.trip_date_id (YYYYMMDD int)
+ * using DATE_TRUNC('week', ...) which returns Monday in Redshift.
  */
 function buildRetentionQuery(filters = {}, weeklyMode = false) {
   const { fleetLevel, warehouseId, orderStatus } = filters;
   const params = [];
-  const whereClauses = ["d.year = 2026", "d.week_of_year >= 2"];
+  const whereClauses = [
+    "TO_DATE(t.trip_date_id::varchar, 'YYYYMMDD') >= '2026-01-05'",
+  ];
   let statusJoin = '';
 
   // Fleet level — whitelisted so safe to inline
@@ -35,79 +50,59 @@ function buildRetentionQuery(filters = {}, weeklyMode = false) {
     whereClauses.push(`fo.current_status = $${params.length}`);
   }
 
-  // Tab 2: restrict to last 3 weeks using actual trip data (dim_date has all 52 weeks)
+  // Tab 2: restrict to last 3 weeks using date arithmetic (no dim_date needed)
   const weekFilter = weeklyMode
-    ? `AND d.week_of_year >= (
-          SELECT MAX(d2.week_of_year) - 2
-          FROM public_mart_riders.fact_rider_trip_orders t2
-          JOIN public_conformed.dim_date d2 ON t2.trip_date_id = d2.date_id
-          WHERE d2.year = 2026
-       )`
+    ? `AND DATE_TRUNC('week', TO_DATE(t.trip_date_id::varchar, 'YYYYMMDD')) >= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '14 days'`
     : '';
 
   const sql = `
     WITH rider_week_activity AS (
       SELECT DISTINCT
         t.rider_id,
-        d.week_of_year,
-        d.year
+        DATE_TRUNC('week', TO_DATE(t.trip_date_id::varchar, 'YYYYMMDD')) AS week_start
       FROM public_mart_riders.fact_rider_trip_orders t
-      JOIN public_conformed.dim_date d ON t.trip_date_id = d.date_id
       JOIN public_conformed.dim_rider r ON t.rider_id = r.rider_id
       ${statusJoin}
       WHERE ${whereClauses.join(' AND ')}
       ${weekFilter}
     ),
-    week_starts AS (
-      SELECT week_of_year, year, TO_CHAR(full_date, 'YYYY-MM-DD') AS week_start_date
-      FROM public_conformed.dim_date
-      WHERE year = 2026
-        AND day_name = 'Monday'
-    ),
     cohort_base AS (
-      SELECT year, week_of_year, COUNT(DISTINCT rider_id) AS active_riders
+      SELECT week_start, COUNT(DISTINCT rider_id) AS active_riders
       FROM rider_week_activity
-      GROUP BY year, week_of_year
+      GROUP BY week_start
     ),
     w1_retained AS (
       SELECT
-        a.year,
-        a.week_of_year,
+        a.week_start,
         COUNT(DISTINCT b.rider_id) AS retained_w1
       FROM rider_week_activity a
       JOIN rider_week_activity b
-        ON  a.rider_id      = b.rider_id
-        AND b.year          = a.year
-        AND b.week_of_year  = a.week_of_year + 1
-      GROUP BY a.year, a.week_of_year
+        ON  a.rider_id  = b.rider_id
+        AND b.week_start = DATEADD(week, 1, a.week_start)
+      GROUP BY a.week_start
     ),
     w2_retained AS (
       SELECT
-        a.year,
-        a.week_of_year,
+        a.week_start,
         COUNT(DISTINCT b.rider_id) AS retained_w2
       FROM rider_week_activity a
       JOIN rider_week_activity b
-        ON  a.rider_id      = b.rider_id
-        AND b.year          = a.year
-        AND b.week_of_year  = a.week_of_year + 2
-      GROUP BY a.year, a.week_of_year
+        ON  a.rider_id  = b.rider_id
+        AND b.week_start = DATEADD(week, 2, a.week_start)
+      GROUP BY a.week_start
     )
     SELECT
-      c.year,
-      c.week_of_year,
-      (c.week_of_year - 1)                                                         AS user_week_number,
-      ws.week_start_date,
+      TO_CHAR(c.week_start, 'YYYY-MM-DD')                                            AS week_start_date,
+      DATEDIFF(week, '2026-01-05', c.week_start) + 1                                 AS user_week_number,
       c.active_riders,
-      COALESCE(w1.retained_w1, 0)                                                  AS retained_w1,
-      COALESCE(w2.retained_w2, 0)                                                  AS retained_w2,
-      ROUND(COALESCE(w1.retained_w1, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)  AS w1_pct,
-      ROUND(COALESCE(w2.retained_w2, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)  AS w2_pct
+      COALESCE(w1.retained_w1, 0)                                                    AS retained_w1,
+      COALESCE(w2.retained_w2, 0)                                                    AS retained_w2,
+      ROUND(COALESCE(w1.retained_w1, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)    AS w1_pct,
+      ROUND(COALESCE(w2.retained_w2, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)    AS w2_pct
     FROM cohort_base c
-    LEFT JOIN w1_retained w1 ON c.year = w1.year AND c.week_of_year = w1.week_of_year
-    LEFT JOIN w2_retained w2 ON c.year = w2.year AND c.week_of_year = w2.week_of_year
-    LEFT JOIN week_starts  ws ON c.year = ws.year AND c.week_of_year = ws.week_of_year
-    ORDER BY c.year, c.week_of_year
+    LEFT JOIN w1_retained w1 ON c.week_start = w1.week_start
+    LEFT JOIN w2_retained w2 ON c.week_start = w2.week_start
+    ORDER BY c.week_start
   `;
 
   return { sql, params };

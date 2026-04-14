@@ -8,21 +8,21 @@ const VALID_FLEET_LEVELS = {
   '3': "LOWER(r.vehicle_type) IN ('zen_small', 'zen_large')",
 };
 const VALID_STATUSES = new Set([
-  'delivered', 'cancelled', 'failed', 'returned', 'accepted',
-  'dispatch', 'ready', 'rejected', 'arrived',
+  'delivered','cancelled','failed','returned','accepted',
+  'dispatch','ready','rejected','arrived',
 ]);
 
 // GET /api/kpi
 // Returns:
-//   total_active_riders   — distinct riders active in current week (Mon–today)
-//   current_week_retention_pct — % of prev week's riders who came back this week
-//   prev_week_riders       — base count for context
+//   total_active_riders          — distinct riders with ≥1 trip since Monday
+//   current_week_retention_pct   — % of prev week's riders who returned this week
+//   prev_week_riders             — base count for tooltip context
 router.get('/', async (req, res) => {
   try {
     const { fleet_level, warehouse_id, order_status } = req.query;
     const params = [];
-    const extraJoins = [];
-    const extraWhere = [];
+    const extraJoins  = [];
+    const extraWhere  = [];
 
     if (fleet_level && fleet_level !== 'all' && VALID_FLEET_LEVELS[fleet_level]) {
       extraWhere.push(VALID_FLEET_LEVELS[fleet_level]);
@@ -37,27 +37,25 @@ router.get('/', async (req, res) => {
       extraWhere.push(`fo.current_status = $${params.length}`);
     }
 
-    const joinSql   = extraJoins.join('\n');
-    const whereSql  = extraWhere.length ? 'AND ' + extraWhere.join(' AND ') : '';
+    const joinSql  = extraJoins.join('\n');
+    const whereSql = extraWhere.length ? 'AND ' + extraWhere.join(' AND ') : '';
 
     const sql = `
       WITH curr_week AS (
         SELECT DISTINCT t.rider_id
         FROM public_mart_riders.fact_rider_trip_orders t
-        JOIN public_conformed.dim_date d ON t.trip_date_id = d.date_id
         JOIN public_conformed.dim_rider r ON t.rider_id = r.rider_id
         ${joinSql}
-        WHERE d.full_date >= DATE_TRUNC('week', CURRENT_DATE)
+        WHERE TO_DATE(t.trip_date_id::varchar, 'YYYYMMDD') >= DATE_TRUNC('week', CURRENT_DATE)
           ${whereSql}
       ),
       prev_week AS (
         SELECT DISTINCT t.rider_id
         FROM public_mart_riders.fact_rider_trip_orders t
-        JOIN public_conformed.dim_date d ON t.trip_date_id = d.date_id
         JOIN public_conformed.dim_rider r ON t.rider_id = r.rider_id
         ${joinSql}
-        WHERE d.full_date >= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'
-          AND d.full_date  < DATE_TRUNC('week', CURRENT_DATE)
+        WHERE TO_DATE(t.trip_date_id::varchar, 'YYYYMMDD') >= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '7 days'
+          AND TO_DATE(t.trip_date_id::varchar, 'YYYYMMDD')  < DATE_TRUNC('week', CURRENT_DATE)
           ${whereSql}
       ),
       retained AS (
