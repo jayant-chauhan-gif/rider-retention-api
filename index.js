@@ -14,6 +14,17 @@ app.use(express.json());
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 
+// Connection test — exposes raw DB error for diagnosis
+app.get('/debug/db', async (req, res) => {
+  const pool = require('./db');
+  try {
+    const result = await pool.query('SELECT 1 AS ok');
+    res.json({ connected: true, result: result.rows });
+  } catch (err) {
+    res.status(500).json({ connected: false, error: err.message, code: err.code });
+  }
+});
+
 // Routes
 app.use('/api/cohort',  cohortRoutes);
 app.use('/api/kpi',     kpiRoutes);
