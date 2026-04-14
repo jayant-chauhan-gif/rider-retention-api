@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: rider-retention-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: REDSHIFT_HOST
+        sync: false
+      - key: REDSHIFT_DB
+        sync: false
+      - key: REDSHIFT_USER
+        sync: false
+      - key: REDSHIFT_PASSWORD
+        sync: false
+      - key: REDSHIFT_PORT
+        value: "5439"
+      - key: PORT
+        value: "3001"
