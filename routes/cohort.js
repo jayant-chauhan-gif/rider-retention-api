@@ -90,18 +90,34 @@ function buildRetentionQuery(filters = {}, weeklyMode = false) {
         ON  a.rider_id  = b.rider_id
         AND b.week_start = DATEADD(week, 2, a.week_start)
       GROUP BY a.week_start
+    ),
+    reactivated AS (
+      SELECT a.week_start, COUNT(DISTINCT a.rider_id) AS reactivated
+      FROM rider_week_activity a
+      WHERE EXISTS (
+        SELECT 1 FROM rider_week_activity b
+        WHERE b.rider_id = a.rider_id AND b.week_start = DATEADD(week, 2, a.week_start)
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM rider_week_activity c
+        WHERE c.rider_id = a.rider_id AND c.week_start = DATEADD(week, 1, a.week_start)
+      )
+      GROUP BY a.week_start
     )
     SELECT
-      TO_CHAR(c.week_start, 'YYYY-MM-DD')                                            AS week_start_date,
-      DATEDIFF(week, '2026-01-05', c.week_start) + 1                                 AS user_week_number,
+      TO_CHAR(c.week_start, 'YYYY-MM-DD')                                               AS week_start_date,
+      DATEDIFF(week, '2026-01-05', c.week_start) + 1                                    AS user_week_number,
       c.active_riders,
-      COALESCE(w1.retained_w1, 0)                                                    AS retained_w1,
-      COALESCE(w2.retained_w2, 0)                                                    AS retained_w2,
-      ROUND(COALESCE(w1.retained_w1, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)    AS w1_pct,
-      ROUND(COALESCE(w2.retained_w2, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)    AS w2_pct
+      COALESCE(w1.retained_w1, 0)                                                       AS retained_w1,
+      COALESCE(w2.retained_w2, 0)                                                       AS retained_w2,
+      COALESCE(r.reactivated,  0)                                                       AS reactivated,
+      ROUND(COALESCE(w1.retained_w1, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)       AS w1_pct,
+      ROUND(COALESCE(w2.retained_w2, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)       AS w2_pct,
+      ROUND(COALESCE(r.reactivated,  0) * 100.0 / NULLIF(c.active_riders, 0), 1)       AS reactivation_pct
     FROM cohort_base c
     LEFT JOIN w1_retained w1 ON c.week_start = w1.week_start
     LEFT JOIN w2_retained w2 ON c.week_start = w2.week_start
+    LEFT JOIN reactivated  r  ON c.week_start = r.week_start
     ORDER BY c.week_start
   `;
 
