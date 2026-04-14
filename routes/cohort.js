@@ -20,9 +20,8 @@ const VALID_STATUSES = new Set([
  * weeklyMode = true  → only last 3 weeks (Tab 2)
  * weeklyMode = false → all weeks from W1 2026 (Tab 1)
  *
- * No dependency on dim_date — week start computed directly
- * from fact_rider_trip_orders.trip_date_id (YYYYMMDD int)
- * using DATE_TRUNC('week', ...) which returns Monday in Redshift.
+ * Retention tracked at W+1, W+2, W+3, W+4.
+ * Reactivation = active in W0, skipped W+1, returned in W+2.
  */
 function buildRetentionQuery(filters = {}, weeklyMode = false) {
   const { fleetLevel, warehouseId, orderStatus } = filters;
@@ -32,25 +31,22 @@ function buildRetentionQuery(filters = {}, weeklyMode = false) {
   ];
   let statusJoin = '';
 
-  // Fleet level — whitelisted so safe to inline
   if (fleetLevel && fleetLevel !== 'all' && VALID_FLEET_LEVELS[fleetLevel]) {
     whereClauses.push(VALID_FLEET_LEVELS[fleetLevel]);
   }
 
-  // Warehouse — parameterised
   if (warehouseId && warehouseId !== 'all') {
     params.push(warehouseId);
     whereClauses.push(`r.warehouse_id = $${params.length}`);
   }
 
-  // Order status — whitelisted then parameterised
   if (orderStatus && orderStatus !== 'all' && VALID_STATUSES.has(orderStatus)) {
     params.push(orderStatus);
     statusJoin = `JOIN public_mart_orders.fact_orders fo ON t.order_id = fo.order_id`;
     whereClauses.push(`fo.current_status = $${params.length}`);
   }
 
-  // Tab 2: restrict to last 3 weeks using date arithmetic (no dim_date needed)
+  // Tab 2: restrict to last 3 weeks
   const weekFilter = weeklyMode
     ? `AND DATE_TRUNC('week', TO_DATE(t.trip_date_id::varchar, 'YYYYMMDD')) >= DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '14 days'`
     : '';
@@ -72,36 +68,48 @@ function buildRetentionQuery(filters = {}, weeklyMode = false) {
       GROUP BY week_start
     ),
     w1_retained AS (
-      SELECT
-        a.week_start,
-        COUNT(DISTINCT b.rider_id) AS retained_w1
+      SELECT a.week_start, COUNT(DISTINCT b.rider_id) AS retained_w1
       FROM rider_week_activity a
       JOIN rider_week_activity b
-        ON  a.rider_id  = b.rider_id
+        ON  a.rider_id   = b.rider_id
         AND b.week_start = DATEADD(week, 1, a.week_start)
       GROUP BY a.week_start
     ),
     w2_retained AS (
-      SELECT
-        a.week_start,
-        COUNT(DISTINCT b.rider_id) AS retained_w2
+      SELECT a.week_start, COUNT(DISTINCT b.rider_id) AS retained_w2
       FROM rider_week_activity a
       JOIN rider_week_activity b
-        ON  a.rider_id  = b.rider_id
+        ON  a.rider_id   = b.rider_id
         AND b.week_start = DATEADD(week, 2, a.week_start)
       GROUP BY a.week_start
     ),
+    w3_retained AS (
+      SELECT a.week_start, COUNT(DISTINCT b.rider_id) AS retained_w3
+      FROM rider_week_activity a
+      JOIN rider_week_activity b
+        ON  a.rider_id   = b.rider_id
+        AND b.week_start = DATEADD(week, 3, a.week_start)
+      GROUP BY a.week_start
+    ),
+    w4_retained AS (
+      SELECT a.week_start, COUNT(DISTINCT b.rider_id) AS retained_w4
+      FROM rider_week_activity a
+      JOIN rider_week_activity b
+        ON  a.rider_id   = b.rider_id
+        AND b.week_start = DATEADD(week, 4, a.week_start)
+      GROUP BY a.week_start
+    ),
     reactivated AS (
+      -- Riders active in W0, skipped W+1, but returned in W+2
       SELECT a.week_start, COUNT(DISTINCT a.rider_id) AS reactivated
       FROM rider_week_activity a
-      WHERE EXISTS (
-        SELECT 1 FROM rider_week_activity b
-        WHERE b.rider_id = a.rider_id AND b.week_start = DATEADD(week, 2, a.week_start)
-      )
-      AND NOT EXISTS (
-        SELECT 1 FROM rider_week_activity c
-        WHERE c.rider_id = a.rider_id AND c.week_start = DATEADD(week, 1, a.week_start)
-      )
+      JOIN rider_week_activity w2
+        ON  a.rider_id   = w2.rider_id
+        AND w2.week_start = DATEADD(week, 2, a.week_start)
+      LEFT JOIN rider_week_activity w1
+        ON  a.rider_id   = w1.rider_id
+        AND w1.week_start = DATEADD(week, 1, a.week_start)
+      WHERE w1.rider_id IS NULL
       GROUP BY a.week_start
     )
     SELECT
@@ -110,13 +118,19 @@ function buildRetentionQuery(filters = {}, weeklyMode = false) {
       c.active_riders,
       COALESCE(w1.retained_w1, 0)                                                       AS retained_w1,
       COALESCE(w2.retained_w2, 0)                                                       AS retained_w2,
+      COALESCE(w3.retained_w3, 0)                                                       AS retained_w3,
+      COALESCE(w4.retained_w4, 0)                                                       AS retained_w4,
       COALESCE(r.reactivated,  0)                                                       AS reactivated,
       ROUND(COALESCE(w1.retained_w1, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)       AS w1_pct,
       ROUND(COALESCE(w2.retained_w2, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)       AS w2_pct,
+      ROUND(COALESCE(w3.retained_w3, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)       AS w3_pct,
+      ROUND(COALESCE(w4.retained_w4, 0) * 100.0 / NULLIF(c.active_riders, 0), 1)       AS w4_pct,
       ROUND(COALESCE(r.reactivated,  0) * 100.0 / NULLIF(c.active_riders, 0), 1)       AS reactivation_pct
     FROM cohort_base c
     LEFT JOIN w1_retained w1 ON c.week_start = w1.week_start
     LEFT JOIN w2_retained w2 ON c.week_start = w2.week_start
+    LEFT JOIN w3_retained w3 ON c.week_start = w3.week_start
+    LEFT JOIN w4_retained w4 ON c.week_start = w4.week_start
     LEFT JOIN reactivated  r  ON c.week_start = r.week_start
     ORDER BY c.week_start
   `;
