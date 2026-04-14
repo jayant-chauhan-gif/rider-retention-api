@@ -2,9 +2,10 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
-const cohortRoutes  = require('./routes/cohort');
-const kpiRoutes     = require('./routes/kpi');
-const filterRoutes  = require('./routes/filters');
+const cohortRoutes      = require('./routes/cohort');
+const kpiRoutes         = require('./routes/kpi');
+const filterRoutes      = require('./routes/filters');
+const compositionRoutes = require('./routes/composition');
 
 const app = express();
 
@@ -26,9 +27,10 @@ app.get('/debug/db', async (req, res) => {
 });
 
 // Routes
-app.use('/api/cohort',  cohortRoutes);
-app.use('/api/kpi',     kpiRoutes);
-app.use('/api/filters', filterRoutes);
+app.use('/api/cohort',       cohortRoutes);
+app.use('/api/kpi',          kpiRoutes);
+app.use('/api/filters',      filterRoutes);
+app.use('/api/composition',  compositionRoutes);
 
 // 404
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
